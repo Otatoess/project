@@ -1,0 +1,195 @@
+import tkinter as tk
+from tkinter import filedialog, ttk
+from PIL import Image, ImageTk
+import tensorflow as tf
+import numpy as np
+import asyncio
+import bleak
+from bleak import BleakClient
+import threading
+import queue
+import os
+
+# Constants
+IMG_SIZE = 224
+ESP32_MAC_ADDRESS = "34:5F:45:AA:E0:AE"  # Your ESP32's MAC address
+ESP32_SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
+ESP32_CHAR_UUID = "abcdef01-1234-5678-1234-56789abcdef0"
+
+class AIPredictor(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        # Initialize variables
+        self.model = tf.keras.models.load_model('final_model.h5')
+        self.class_names = [
+            ('Colon adenocarcinoma', 1),
+            ('ben/normal colon', 0),
+            ('Colon adenocarcinoma', 1),
+            ('ben/normal lung', 0),
+            ('Lung scc', 1)
+        ]
+        self.ble_queue = queue.Queue()
+        self.client = None
+        self.connected = False
+        self.current_image = None
+        self.ble_lock = threading.Lock()
+        
+        self.setup_ui()
+        
+        # Start BLE thread
+        self.ble_thread = threading.Thread(target=self.run_ble_loop, daemon=True)
+        self.ble_thread.start()
+
+    def setup_ui(self):
+        self.title("AI Predictor with BLE")
+        self.geometry("800x600")
+
+        # Main frame
+        main_frame = ttk.Frame(self)
+        main_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+        # Status bar
+        self.status_var = tk.StringVar(value="Not connected to ESP32")
+        status_label = ttk.Label(main_frame, textvariable=self.status_var)
+        status_label.pack(pady=5)
+
+        # Image frame
+        image_frame = ttk.LabelFrame(main_frame, text="Image Preview")
+        image_frame.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        self.image_label = ttk.Label(image_frame)
+        self.image_label.pack(pady=10)
+
+        # Controls frame
+        controls_frame = ttk.Frame(main_frame)
+        controls_frame.pack(pady=10, fill=tk.X)
+
+        # Buttons
+        self.connect_btn = ttk.Button(controls_frame, text="Connect to ESP32", command=self.connect_ble)
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+
+        self.select_btn = ttk.Button(controls_frame, text="Select Image", command=self.select_image)
+        self.select_btn.pack(side=tk.LEFT, padx=5)
+
+        self.predict_btn = ttk.Button(controls_frame, text="Predict", command=self.make_prediction, state=tk.DISABLED)
+        self.predict_btn.pack(side=tk.LEFT, padx=5)
+
+        # Results frame
+        results_frame = ttk.LabelFrame(main_frame, text="Prediction Results")
+        results_frame.pack(pady=10, padx=10, fill=tk.BOTH)
+
+        self.result_text = tk.Text(results_frame, height=5, width=50)
+        self.result_text.pack(pady=5, padx=5, fill=tk.BOTH)
+
+    async def connect_esp32(self):
+        try:
+            async with BleakClient(ESP32_MAC_ADDRESS, timeout=20.0) as client:
+                self.client = client
+                # Use the is_connected property instead of calling it as a method
+                if client.is_connected:
+                    self.connected = True
+                    self.status_var.set("Connected to ESP32")
+                    self.connect_btn.configure(text="Disconnect", command=self.disconnect_ble)
+                    
+                    # Keep the connection alive
+                    while self.connected:
+                        await asyncio.sleep(0.1)
+                        # Use the is_connected property
+                        if not client.is_connected:
+                            break
+                            
+        except Exception as e:
+            self.status_var.set(f"Connection failed: {str(e)}")
+            self.connected = False
+            self.client = None
+
+    def connect_ble(self):
+        if not self.connected:
+            self.ble_thread = threading.Thread(target=lambda: asyncio.run(self.connect_esp32()), daemon=True)
+            self.ble_thread.start()
+        else:
+            self.disconnect_ble()
+
+    def disconnect_ble(self):
+        self.connected = False
+        self.client = None
+        self.status_var.set("Disconnected from ESP32")
+        self.connect_btn.configure(text="Connect to ESP32", command=self.connect_ble)
+
+    async def send_ble_data(self, data):
+        try:
+            # Use the is_connected property
+            if self.client and self.client.is_connected:
+                await self.client.write_gatt_char(ESP32_CHAR_UUID, data.encode('utf-8'))
+                print(f"Sent data: {data}")
+                return True
+        except Exception as e:
+            print(f"Error sending data: {str(e)}")
+            self.status_var.set(f"Failed to send data: {str(e)}")
+        return False
+
+    def run_ble_loop(self):
+        while True:
+            if not self.ble_queue.empty() and self.connected:
+                data = self.ble_queue.get()
+                asyncio.run(self.send_ble_data(data))
+            self.update()
+            self.after(100)
+
+    def select_image(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff")]
+        )
+        if file_path:
+            image = Image.open(file_path)
+            image = image.resize((IMG_SIZE, IMG_SIZE))
+            photo = ImageTk.PhotoImage(image)
+            
+            self.image_label.configure(image=photo)
+            self.image_label.image = photo
+            self.current_image = image
+            self.predict_btn.configure(state=tk.NORMAL)
+
+    def make_prediction(self):
+        if self.current_image is None:
+            return
+
+        # Preprocess image
+        img_array = tf.keras.preprocessing.image.img_to_array(self.current_image)
+        img_array = np.expand_dims(img_array, axis=0)
+        img_array = img_array / 255.0
+
+        # Make prediction
+        predictions = self.model.predict(img_array)
+        predicted_class = np.argmax(predictions[0])
+        confidence = float(predictions[0][predicted_class])
+
+        # Format results with severity level
+        predicted_name, predicted_severity = self.class_names[predicted_class]
+        severity_text = "Severe/Malignant" if predicted_severity == 1 else "Benign/Normal"
+        
+        result = f"Predicted class: {predicted_name}\n"
+        result += f"Severity: {severity_text}\n"
+        result += f"Confidence: {confidence:.2%}\n\n"
+        result += "Top 3 predictions:\n"
+        
+        top_3 = np.argsort(predictions[0])[-3:][::-1]
+        for idx in top_3:
+            name, severity = self.class_names[idx]
+            severity_label = "Severe/Malignant" if severity == 1 else "Benign/Normal"
+            result += f"{name} ({severity_label}): {float(predictions[0][idx]):.2%}\n"
+
+        # Update UI
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, result)
+
+        # Send to ESP32 if connected
+        if self.connected and self.client:
+            ble_data = f"{predicted_name},{confidence},{predicted_severity}"
+            self.ble_queue.put(ble_data)
+            print(f"Queued data: {ble_data}")
+
+if __name__ == "__main__":
+    app = AIPredictor()
+    app.mainloop()
